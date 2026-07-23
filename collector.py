@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import requests
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 import OpenDartReader as OpenDartReader
 
@@ -16,7 +17,7 @@ def safe_int(val):
     if not val or val == '-':
         return None
     try:
-        return int(str(val).replace(',', '').strip())
+        return int(str(val).replace(',', '').replace('원', '').strip())
     except:
         return None
 
@@ -24,13 +25,13 @@ def safe_float(val):
     if not val or val == '-':
         return None
     try:
-        return float(str(val).replace(',', '').strip())
+        return float(str(val).replace(',', '').replace('%', '').strip())
     except:
         return None
 
-def fetch_naver_stock_data(code):
-    """네이버 증권 API를 통해 주가 및 투자지표 수집"""
-    url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+def fetch_naver_finance_html(code):
+    """네이버 증권 PC 웹페이지 스크래핑"""
+    url = f"https://finance.naver.com/item/main.naver?code={code}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -39,19 +40,71 @@ def fetch_naver_stock_data(code):
     if res.status_code != 200:
         return {}
     
-    data = res.json()
+    soup = BeautifulSoup(res.text, 'html.parser')
     
-    # 주요 지표 추출
-    close_price = safe_int(data.get("nowValue"))
-    market_cap = safe_int(data.get("marketValue")) # 백만원 단위인 경우가 많음 (네이버 모바일 API 기준 원 단위 변환 확인)
-    if market_cap:
-        market_cap = market_cap * 1000000 # 억/백만원 단위 보정
-        
-    per = safe_float(data.get("per"))
-    pbr = safe_float(data.get("pbr"))
-    dividend_yield = safe_float(data.get("dividendYield"))
-    foreign_ratio = safe_float(data.get("foreignRatio"))
+    close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
     
+    try:
+        # 1. 현재가
+        no_today = soup.find('p', {'class': 'no_today'})
+        if no_today:
+            close_price = safe_int(no_today.find('span', {'class': 'blind'}).text)
+
+        # 2. 시가총액 (억 단위 -> 원 단위 변환)
+        market_cap_elem = soup.find('id', {'id': '_market_sum'})
+        if not market_cap_elem:
+            # alternative selector
+            for tr in soup.find_all('tr'):
+                if '시가총액' in tr.text:
+                    td = tr.find('td')
+                    if td:
+                        cap_str = td.text.replace('\n', '').replace('\t', '').replace(',', '').strip()
+                        # 억 단위 파싱 예: 412조 5,119 -> 숫자 변환
+                        raw_cap = safe_int(cap_str)
+                        if raw_cap:
+                            market_cap = raw_cap * 100000000
+                    break
+        else:
+            raw_cap = safe_int(market_cap_elem.text)
+            if raw_cap:
+                market_cap = raw_cap * 100000000
+
+        # 3. PER / PBR / 배당수익률 / 외국인소진율
+        per_elem = soup.find('id', {'id': '_per'})
+        if per_elem:
+            per = safe_float(per_elem.text)
+
+        pbr_elem = soup.find('id', {'id': '_pbr'})
+        if pbr_elem:
+            pbr = safe_float(pbr_elem.text)
+
+        dvr_elem = soup.find('id', {'id': '_dvd_yield'})
+        if dvr_elem:
+            dividend_yield = safe_float(dvr_elem.text)
+
+        # 우측 서브테이블 파싱 (PER, PBR, 외국인소진율)
+        aside = soup.find('div', {'class': 'aside_invest_info'})
+        if aside:
+            table = aside.find('table')
+            if table:
+                for tr in table.find_all('tr'):
+                    th = tr.find('th')
+                    td = tr.find('td')
+                    if th and td:
+                        th_text = th.text.strip()
+                        if '외국인한도소진율' in th_text or '외국인소진율' in th_text:
+                            foreign_ratio = safe_float(td.text)
+                        elif 'PER' in th_text and not per:
+                            em = td.find('em')
+                            if em:
+                                per = safe_float(em.text)
+                        elif 'PBR' in th_text and not pbr:
+                            em = td.find('em')
+                            if em:
+                                pbr = safe_float(em.text)
+    except Exception as e:
+        print(f"  └ 파싱 중 오류: {e}")
+
     return {
         "close_price": close_price,
         "market_cap": market_cap,
@@ -82,10 +135,10 @@ def run():
         print(f"\n---> [{name} ({code})] 데이터 수집 시작...")
         
         # 1. 네이버 증권 데이터 수집
-        stock_info = fetch_naver_stock_data(code)
-        print(f"  └ 네이버 증권 수집 결과: 주가={stock_info.get('close_price')}, PER={stock_info.get('per')}, 외국인={stock_info.get('foreign_ratio')}%")
+        stock_info = fetch_naver_finance_html(code)
+        print(f"  └ 수집 결과: 주가={stock_info.get('close_price')}원, PER={stock_info.get('per')}, PBR={stock_info.get('pbr')}, 외국인={stock_info.get('foreign_ratio')}%")
 
-        # 2. DART 재무 수집 (당기순이익, 자본총계, ROE)
+        # 2. DART 재무 수집
         net_income, total_equity, roe = None, None, None
         try:
             fin = dart.finstate(code, current_year, reprt_code='11011')
