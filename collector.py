@@ -11,19 +11,48 @@ DART_API_KEY = os.environ.get("DART_API_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 dart = OpenDartReader(DART_API_KEY)
 
+def safe_int(val):
+    """숫자 문자열 안전하게 int 변환 (콤마, 하이픈 등 처리)"""
+    if not val or val == '-':
+        return None
+    try:
+        return int(str(val).replace(',', '').strip())
+    except:
+        return None
+
+def get_latest_trading_date():
+    """가장 최근 영업일 조회 (pykrx 기준)"""
+    today = datetime.datetime.now()
+    for i in range(10): # 최근 10일 탐색
+        target_dt = today - datetime.timedelta(days=i)
+        target_str = target_dt.strftime("%Y%m%d")
+        df = stock.get_market_ohlcv_by_date(target_str, target_str, "005930")
+        if not df.empty and df['종가'].iloc[0] > 0:
+            return target_str, target_dt.strftime("%Y-%m-%d")
+    return today.strftime("%Y%m%d"), today.strftime("%Y-%m-%d")
+
 def run():
-    today_dt = datetime.datetime.now()
-    today_str = today_dt.strftime("%Y%m%d")
-    date_formatted = today_dt.strftime("%Y-%m-%d")
-    current_year = today_dt.year - 1
+    # 최근 거래 가능일 찾기
+    today_str, date_formatted = get_latest_trading_date()
+    current_year = datetime.datetime.now().year - 1
+    print(f"기준 거래일: {date_formatted} ({today_str})")
 
     # 워치리스트 조회
-    stocks = supabase.table("watchlist").select("*").execute().data
+    res = supabase.table("watchlist").select("*").execute()
+    stocks = res.data if res else []
+    print(f"조회된 종목 수: {len(stocks)}개")
+
+    if not stocks:
+        print("⚠️ 워치리스트에 종목이 없습니다. watchlist 테이블을 확인하세요.")
+        return
 
     for item in stocks:
-        code = item['stock_code']
+        code = item.get('stock_code')
+        name = item.get('stock_name', code)
+        print(f"\n---> [{name} ({code})] 데이터 수집 시작...")
+        
         try:
-            # 1. 일별 시세 수집
+            # 1. 일별 시세/지표 수집
             df_price = stock.get_market_ohlcv_by_date(today_str, today_str, code)
             close_price = int(df_price['종가'].iloc[0]) if not df_price.empty else None
 
@@ -31,26 +60,29 @@ def run():
             market_cap = int(df_cap['시가총액'].iloc[0]) if not df_cap.empty else None
 
             df_fund = stock.get_market_fundamental_by_date(today_str, today_str, code)
-            per = float(df_fund['PER'].iloc[0]) if not df_fund.empty else None
-            pbr = float(df_fund['PBR'].iloc[0]) if not df_fund.empty else None
-            dividend_yield = float(df_fund['DIV'].iloc[0]) if not df_fund.empty else None
+            per = float(df_fund['PER'].iloc[0]) if not df_fund.empty and 'PER' in df_fund else None
+            pbr = float(df_fund['PBR'].iloc[0]) if not df_fund.empty and 'PBR' in df_fund else None
+            dividend_yield = float(df_fund['DIV'].iloc[0]) if not df_fund.empty and 'DIV' in df_fund else None
 
             df_foreign = stock.get_exhaustion_rates_of_foreign_investor_by_date(today_str, today_str, code)
-            foreign_ratio = float(df_foreign['지분율'].iloc[0]) if not df_foreign.empty else None
+            foreign_ratio = float(df_foreign['지분율'].iloc[0]) if not df_foreign.empty and '지분율' in df_foreign else None
 
             # 2. DART 재무 수집 (당기순이익, 자본총계)
-            fin = dart.finstate(code, current_year, reprt_code='11011')
             net_income, total_equity, roe = None, None, None
-            if fin is not None and not fin.empty:
-                net_row = fin[fin['account_nm'].str.contains('당기순이익', na=False)]
-                eq_row = fin[fin['account_nm'].str.contains('자본총계', na=False)]
-                
-                if not net_row.empty:
-                    net_income = int(net_row['thstrm_amount'].iloc[0].replace(',', ''))
-                if not eq_row.empty:
-                    total_equity = int(eq_row['thstrm_amount'].iloc[0].replace(',', ''))
-                if net_income and total_equity:
-                    roe = round((net_income / total_equity) * 100, 2)
+            try:
+                fin = dart.finstate(code, current_year, reprt_code='11011')
+                if fin is not None and not fin.empty:
+                    net_row = fin[fin['account_nm'].str.contains('당기순이익', na=False)]
+                    eq_row = fin[fin['account_nm'].str.contains('자본총계', na=False)]
+                    
+                    if not net_row.empty:
+                        net_income = safe_int(net_row['thstrm_amount'].iloc[0])
+                    if not eq_row.empty:
+                        total_equity = safe_int(eq_row['thstrm_amount'].iloc[0])
+                    if net_income and total_equity and total_equity != 0:
+                        roe = round((net_income / total_equity) * 100, 2)
+            except Exception as dart_err:
+                print(f"  └ DART 수집 경고 ({name}): {dart_err}")
 
             payload = {
                 "stock_code": code,
@@ -67,10 +99,12 @@ def run():
                 "shareholder_return_rate": None
             }
 
+            # Supabase 저장 (Upsert)
             supabase.table("daily_stock_metrics").upsert(payload, on_conflict="stock_code,date").execute()
-            print(f"[{item['stock_name']}] 수집 성공")
+            print(f"✅ [{name}] Supabase 저장 성공!")
+
         except Exception as e:
-            print(f"[{code}] 오류 발생: {e}")
+            print(f"❌ [{name} ({code})] 처리 중 오류 발생: {e}")
 
 if __name__ == "__main__":
     run()
