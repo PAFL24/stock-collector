@@ -1,0 +1,5 @@
+pandas
+supabase
+opendartreader
+requests
+beautifulsoup4
