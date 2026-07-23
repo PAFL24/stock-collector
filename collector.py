@@ -2,6 +2,7 @@ import os
 import time
 import datetime
 import requests
+from bs4 import BeautifulSoup
 from supabase import create_client, Client
 import OpenDartReader as OpenDartReader
 
@@ -13,50 +14,83 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 dart = OpenDartReader(DART_API_KEY)
 
 def safe_int(val):
-    if val is None or val == '-':
+    if val is None or val == '-' or val == '':
         return None
     try:
-        return int(str(val).replace(',', '').strip())
+        clean = str(val).replace(',', '').replace('원', '').replace('억', '').strip()
+        return int(clean)
     except:
         return None
 
 def safe_float(val):
-    if val is None or val == '-':
+    if val is None or val == '-' or val == '':
         return None
     try:
-        return float(str(val).replace(',', '').strip())
+        clean = str(val).replace(',', '').replace('%', '').replace('배', '').strip()
+        return float(clean)
     except:
         return None
 
-def fetch_stock_data_from_naver(code):
-    # 6자리 자릿수 맞춤 (예: 5930 -> 005930)
+def fetch_naver_finance(code):
+    """네이버 PC 증권 페이지 파싱 (가장 안정적)"""
     formatted_code = str(code).zfill(6)
+    url = f"https://finance.naver.com/item/main.naver?code={formatted_code}"
     
-    url = f"https://m.stock.naver.com/api/stock/{formatted_code}/basic"
     headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
-        "Referer": f"https://m.stock.naver.com/stock/{formatted_code}/total"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7"
     }
     
     try:
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code != 200:
-            print(f"  └ HTTP 요청 실패 (코드: {res.status_code})")
+            print(f"  └ HTTP 오류: {res.status_code}")
             return {}
+            
+        soup = BeautifulSoup(res.text, 'html.parser')
         
-        data = res.json()
+        close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
         
-        close_price = safe_int(data.get("nowValue"))
-        
-        # 시가총액 (백만원 단위 -> 원 단위로 변환)
-        raw_market_cap = safe_int(data.get("marketValue"))
-        market_cap = raw_market_cap * 1000000 if raw_market_cap else None
-        
-        per = safe_float(data.get("per"))
-        pbr = safe_float(data.get("pbr"))
-        dividend_yield = safe_float(data.get("dividendYield"))
-        foreign_ratio = safe_float(data.get("foreignRatio"))
-                
+        # 1. 현재가 파싱
+        today_elem = soup.select_one("p.no_today span.blind")
+        if today_elem:
+            close_price = safe_int(today_elem.text)
+            
+        # 2. 시가총액 파싱 (억 단위 -> 원 단위)
+        market_cap_elem = soup.select_one("#_market_sum")
+        if market_cap_elem:
+            cap_raw = market_cap_elem.text.replace('\n', '').replace('\t', '').replace(',', '').strip()
+            # 예: '412조 5,119' 또는 '51,119'
+            if '조' in cap_raw:
+                parts = cap_raw.split('조')
+                cho = safe_int(parts[0]) or 0
+                eok = safe_int(parts[1]) or 0
+                market_cap = (cho * 10000 + eok) * 100000000
+            else:
+                eok = safe_int(cap_raw) or 0
+                market_cap = eok * 100000000
+
+        # 3. PER, PBR, 배당수익률, 외국인소진율 파싱
+        per_elem = soup.select_one("#_per")
+        if per_elem:
+            per = safe_float(per_elem.text)
+            
+        pbr_elem = soup.select_one("#_pbr")
+        if pbr_elem:
+            pbr = safe_float(pbr_elem.text)
+            
+        dvd_elem = soup.select_one("#_dvd_yield")
+        if dvd_elem:
+            dividend_yield = safe_float(dvd_elem.text)
+            
+        # 우측 외국인 소진율
+        for tr in soup.select("div.aside_invest_info table tr"):
+            if "외국인소진율" in tr.text:
+                td = tr.select_one("td")
+                if td:
+                    foreign_ratio = safe_float(td.text)
+                break
+
         return {
             "close_price": close_price,
             "market_cap": market_cap,
@@ -66,7 +100,7 @@ def fetch_stock_data_from_naver(code):
             "foreign_ratio": foreign_ratio
         }
     except Exception as e:
-        print(f"  └ 네이버 API 호출 오류: {e}")
+        print(f"  └ 네이버 스크래핑 오류: {e}")
         return {}
 
 def run():
@@ -86,14 +120,13 @@ def run():
 
     for item in stocks:
         raw_code = item.get('stock_code')
-        # 무조건 6자리 문자열로 변환 (005930)
         code = str(raw_code).zfill(6)
         name = item.get('stock_name', code)
         
         print(f"\n---> [{name} ({code})] 데이터 수집 시작...")
         
         # 1. 네이버 증권 데이터 수집
-        stock_info = fetch_stock_data_from_naver(code)
+        stock_info = fetch_naver_finance(code)
         print(f"  └ 수집 결과: 주가={stock_info.get('close_price')}원, PER={stock_info.get('per')}, PBR={stock_info.get('pbr')}, 외국인={stock_info.get('foreign_ratio')}%")
 
         # 2. DART 재무 수집
