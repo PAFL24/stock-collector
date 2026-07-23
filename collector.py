@@ -30,6 +30,7 @@ def get_latest_trading_date():
             if not df.empty and df['종가'].iloc[0] > 0:
                 return target_str, target_dt.strftime("%Y-%m-%d")
         except:
+            time.sleep(1)
             continue
     return today.strftime("%Y%m%d"), today.strftime("%Y-%m-%d")
 
@@ -53,21 +54,25 @@ def run():
         
         close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
 
-        # 1. 시세 및 시가총액 수집
+        # 1. 시세 수집 (1초 대기)
         try:
             df_price = stock.get_market_ohlcv_by_date(today_str, today_str, code)
             if not df_price.empty:
                 close_price = int(df_price['종가'].iloc[0])
-            
+        except Exception as e:
+            print(f"  └ 주가 수집 실패: {e}")
+        time.sleep(1)
+
+        # 2. 시가총액 수집 (1초 대기)
+        try:
             df_cap = stock.get_market_cap_by_date(today_str, today_str, code)
             if not df_cap.empty:
                 market_cap = int(df_cap['시가총액'].iloc[0])
         except Exception as e:
-            print(f"  └ 주가/시총 수집 실패: {e}")
+            print(f"  └ 시가총액 수집 실패: {e}")
+        time.sleep(1)
 
-        time.sleep(0.5)
-
-        # 2. 투자지표 (PER, PBR, 배당수익률) 수집
+        # 3. 투자지표 수집 (1초 대기)
         try:
             df_fund = stock.get_market_fundamental_by_date(today_str, today_str, code)
             if not df_fund.empty:
@@ -76,18 +81,17 @@ def run():
                 dividend_yield = float(df_fund['DIV'].iloc[0]) if 'DIV' in df_fund else None
         except Exception as e:
             print(f"  └ 펀더멘털 수집 실패: {e}")
+        time.sleep(1)
 
-        time.sleep(0.5)
-
-        # 3. 외국인 지분율 수집
+        # 4. 외국인 지분율 수집 (함수명 수정)
         try:
-            df_foreign = stock.get_exhaustion_rates_of_foreign_investors_by_ticker(today_str, today_str, code)
+            df_foreign = stock.get_exhaustion_rates_of_foreign_investor_by_ticker(today_str, today_str, code)
             if not df_foreign.empty and '지분율' in df_foreign:
                 foreign_ratio = float(df_foreign['지분율'].iloc[0])
         except Exception as e:
             print(f"  └ 외국인 지분율 수집 실패: {e}")
 
-        # 4. DART 재무 수집
+        # 5. DART 재무 수집
         net_income, total_equity, roe = None, None, None
         try:
             fin = dart.finstate(code, current_year, reprt_code='11011')
