@@ -1,7 +1,7 @@
 import os
 import datetime
 from supabase import create_client, Client
-import opendartreader as OpenDartReader
+import OpenDartReader as OpenDartReader
 from pykrx import stock
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
