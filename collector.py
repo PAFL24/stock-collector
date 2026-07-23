@@ -32,7 +32,6 @@ def safe_float(val):
         return None
 
 def fetch_naver_finance(code):
-    """네이버 PC 증권 페이지 파싱 (가장 안정적)"""
     formatted_code = str(code).zfill(6)
     url = f"https://finance.naver.com/item/main.naver?code={formatted_code}"
     
@@ -52,15 +51,23 @@ def fetch_naver_finance(code):
         close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
         
         # 1. 현재가 파싱
-        today_elem = soup.select_one("p.no_today span.blind")
-        if today_elem:
-            close_price = safe_int(today_elem.text)
-            
+        today_div = soup.select_one("p.no_today span.today")
+        if today_div:
+            blind_span = today_div.select_one("span.blind")
+            if blind_span:
+                close_price = safe_int(blind_span.text)
+        
+        if not close_price:
+            no_today = soup.select_one("p.no_today")
+            if no_today:
+                blind_spans = no_today.select("span.blind")
+                if blind_spans:
+                    close_price = safe_int(blind_spans[0].text)
+
         # 2. 시가총액 파싱 (억 단위 -> 원 단위)
         market_cap_elem = soup.select_one("#_market_sum")
         if market_cap_elem:
             cap_raw = market_cap_elem.text.replace('\n', '').replace('\t', '').replace(',', '').strip()
-            # 예: '412조 5,119' 또는 '51,119'
             if '조' in cap_raw:
                 parts = cap_raw.split('조')
                 cho = safe_int(parts[0]) or 0
@@ -70,7 +77,7 @@ def fetch_naver_finance(code):
                 eok = safe_int(cap_raw) or 0
                 market_cap = eok * 100000000
 
-        # 3. PER, PBR, 배당수익률, 외국인소진율 파싱
+        # 3. PER, PBR 파싱
         per_elem = soup.select_one("#_per")
         if per_elem:
             per = safe_float(per_elem.text)
@@ -79,17 +86,25 @@ def fetch_naver_finance(code):
         if pbr_elem:
             pbr = safe_float(pbr_elem.text)
             
+        # 4. 배당수익률 (#_dvd_yield 우선 탐색 후, 우측/하단 테이블 탐색)
         dvd_elem = soup.select_one("#_dvd_yield")
         if dvd_elem:
             dividend_yield = safe_float(dvd_elem.text)
             
-        # 우측 외국인 소진율
+        # 5. 우측 우측 투자정보 테이블 반복 탐색 (외국인소진율, 배당수익률 보완)
         for tr in soup.select("div.aside_invest_info table tr"):
-            if "외국인소진율" in tr.text:
+            tr_text = tr.text.strip()
+            if "외국인소진율" in tr_text:
                 td = tr.select_one("td")
                 if td:
                     foreign_ratio = safe_float(td.text)
-                break
+            elif "추정배당수익률" in tr_text or "배당수익률" in tr_text:
+                if not dividend_yield:
+                    td = tr.select_one("td")
+                    if td:
+                        em = td.select_one("em")
+                        val_str = em.text if em else td.text
+                        dividend_yield = safe_float(val_str)
 
         return {
             "close_price": close_price,
@@ -127,7 +142,7 @@ def run():
         
         # 1. 네이버 증권 데이터 수집
         stock_info = fetch_naver_finance(code)
-        print(f"  └ 수집 결과: 주가={stock_info.get('close_price')}원, PER={stock_info.get('per')}, PBR={stock_info.get('pbr')}, 외국인={stock_info.get('foreign_ratio')}%")
+        print(f"  └ 수집 결과: 주가={stock_info.get('close_price')}원, PER={stock_info.get('per')}, PBR={stock_info.get('pbr')}, 배당수익률={stock_info.get('dividend_yield')}%, 외국인={stock_info.get('foreign_ratio')}%")
 
         # 2. DART 재무 수집
         net_income, total_equity, roe = None, None, None
