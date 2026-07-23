@@ -1,9 +1,9 @@
 import os
 import time
 import datetime
+import requests
 from supabase import create_client, Client
 import OpenDartReader as OpenDartReader
-from pykrx import stock
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -20,24 +20,53 @@ def safe_int(val):
     except:
         return None
 
-def get_latest_trading_date():
-    today = datetime.datetime.now()
-    for i in range(10):
-        target_dt = today - datetime.timedelta(days=i)
-        target_str = target_dt.strftime("%Y%m%d")
-        try:
-            df = stock.get_market_ohlcv_by_date(target_str, target_str, "005930")
-            if not df.empty and df['종가'].iloc[0] > 0:
-                return target_str, target_dt.strftime("%Y-%m-%d")
-        except:
-            time.sleep(1)
-            continue
-    return today.strftime("%Y%m%d"), today.strftime("%Y-%m-%d")
+def safe_float(val):
+    if not val or val == '-':
+        return None
+    try:
+        return float(str(val).replace(',', '').strip())
+    except:
+        return None
+
+def fetch_naver_stock_data(code):
+    """네이버 증권 API를 통해 주가 및 투자지표 수집"""
+    url = f"https://m.stock.naver.com/api/stock/{code}/basic"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        return {}
+    
+    data = res.json()
+    
+    # 주요 지표 추출
+    close_price = safe_int(data.get("nowValue"))
+    market_cap = safe_int(data.get("marketValue")) # 백만원 단위인 경우가 많음 (네이버 모바일 API 기준 원 단위 변환 확인)
+    if market_cap:
+        market_cap = market_cap * 1000000 # 억/백만원 단위 보정
+        
+    per = safe_float(data.get("per"))
+    pbr = safe_float(data.get("pbr"))
+    dividend_yield = safe_float(data.get("dividendYield"))
+    foreign_ratio = safe_float(data.get("foreignRatio"))
+    
+    return {
+        "close_price": close_price,
+        "market_cap": market_cap,
+        "per": per,
+        "pbr": pbr,
+        "dividend_yield": dividend_yield,
+        "foreign_ratio": foreign_ratio
+    }
 
 def run():
-    today_str, date_formatted = get_latest_trading_date()
-    current_year = datetime.datetime.now().year - 1
-    print(f"기준 거래일: {date_formatted} ({today_str})")
+    today_dt = datetime.datetime.now()
+    date_formatted = today_dt.strftime("%Y-%m-%d")
+    current_year = today_dt.year - 1
+    
+    print(f"수집 기준일: {date_formatted}")
 
     res = supabase.table("watchlist").select("*").execute()
     stocks = res.data if res else []
@@ -52,46 +81,11 @@ def run():
         name = item.get('stock_name', code)
         print(f"\n---> [{name} ({code})] 데이터 수집 시작...")
         
-        close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
+        # 1. 네이버 증권 데이터 수집
+        stock_info = fetch_naver_stock_data(code)
+        print(f"  └ 네이버 증권 수집 결과: 주가={stock_info.get('close_price')}, PER={stock_info.get('per')}, 외국인={stock_info.get('foreign_ratio')}%")
 
-        # 1. 시세 수집 (1초 대기)
-        try:
-            df_price = stock.get_market_ohlcv_by_date(today_str, today_str, code)
-            if not df_price.empty:
-                close_price = int(df_price['종가'].iloc[0])
-        except Exception as e:
-            print(f"  └ 주가 수집 실패: {e}")
-        time.sleep(1)
-
-        # 2. 시가총액 수집 (1초 대기)
-        try:
-            df_cap = stock.get_market_cap_by_date(today_str, today_str, code)
-            if not df_cap.empty:
-                market_cap = int(df_cap['시가총액'].iloc[0])
-        except Exception as e:
-            print(f"  └ 시가총액 수집 실패: {e}")
-        time.sleep(1)
-
-        # 3. 투자지표 수집 (1초 대기)
-        try:
-            df_fund = stock.get_market_fundamental_by_date(today_str, today_str, code)
-            if not df_fund.empty:
-                per = float(df_fund['PER'].iloc[0]) if 'PER' in df_fund and df_fund['PER'].iloc[0] != 0 else None
-                pbr = float(df_fund['PBR'].iloc[0]) if 'PBR' in df_fund and df_fund['PBR'].iloc[0] != 0 else None
-                dividend_yield = float(df_fund['DIV'].iloc[0]) if 'DIV' in df_fund else None
-        except Exception as e:
-            print(f"  └ 펀더멘털 수집 실패: {e}")
-        time.sleep(1)
-
-        # 4. 외국인 지분율 수집 (함수명 수정)
-        try:
-            df_foreign = stock.get_exhaustion_rates_of_foreign_investor_by_ticker(today_str, today_str, code)
-            if not df_foreign.empty and '지분율' in df_foreign:
-                foreign_ratio = float(df_foreign['지분율'].iloc[0])
-        except Exception as e:
-            print(f"  └ 외국인 지분율 수집 실패: {e}")
-
-        # 5. DART 재무 수집
+        # 2. DART 재무 수집 (당기순이익, 자본총계, ROE)
         net_income, total_equity, roe = None, None, None
         try:
             fin = dart.finstate(code, current_year, reprt_code='11011')
@@ -111,12 +105,12 @@ def run():
         payload = {
             "stock_code": code,
             "date": date_formatted,
-            "close_price": close_price,
-            "market_cap": market_cap,
-            "per": per,
-            "pbr": pbr,
-            "dividend_yield": dividend_yield,
-            "foreign_ratio": foreign_ratio,
+            "close_price": stock_info.get("close_price"),
+            "market_cap": stock_info.get("market_cap"),
+            "per": stock_info.get("per"),
+            "pbr": stock_info.get("pbr"),
+            "dividend_yield": stock_info.get("dividend_yield"),
+            "foreign_ratio": stock_info.get("foreign_ratio"),
             "net_income": net_income,
             "total_equity": total_equity,
             "roe": roe,
@@ -128,6 +122,8 @@ def run():
             print(f"✅ [{name}] Supabase 저장 성공!")
         except Exception as db_err:
             print(f"❌ [{name}] Supabase 저장 실패: {db_err}")
+
+        time.sleep(0.5)
 
 if __name__ == "__main__":
     run()
