@@ -1,4 +1,5 @@
 import os
+import time
 import datetime
 from supabase import create_client, Client
 import OpenDartReader as OpenDartReader
@@ -57,15 +58,14 @@ def run():
             df_price = stock.get_market_ohlcv_by_date(today_str, today_str, code)
             if not df_price.empty:
                 close_price = int(df_price['종가'].iloc[0])
-        except Exception as e:
-            print(f"  └ 주가 수집 실패: {e}")
-
-        try:
+            
             df_cap = stock.get_market_cap_by_date(today_str, today_str, code)
             if not df_cap.empty:
                 market_cap = int(df_cap['시가총액'].iloc[0])
         except Exception as e:
-            print(f"  └ 시가총액 수집 실패: {e}")
+            print(f"  └ 주가/시총 수집 실패: {e}")
+
+        time.sleep(0.5)
 
         # 2. 투자지표 (PER, PBR, 배당수익률) 수집
         try:
@@ -77,9 +77,11 @@ def run():
         except Exception as e:
             print(f"  └ 펀더멘털 수집 실패: {e}")
 
+        time.sleep(0.5)
+
         # 3. 외국인 지분율 수집
         try:
-            df_foreign = stock.get_exhaustion_rates_of_foreign_investor_by_ticker(today_str, today_str, code)
+            df_foreign = stock.get_exhaustion_rates_of_foreign_investors_by_ticker(today_str, today_str, code)
             if not df_foreign.empty and '지분율' in df_foreign:
                 foreign_ratio = float(df_foreign['지분율'].iloc[0])
         except Exception as e:
