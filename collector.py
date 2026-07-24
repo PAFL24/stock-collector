@@ -49,7 +49,8 @@ def fetch_naver_finance(code):
         soup = BeautifulSoup(res.text, 'html.parser')
         
         close_price, market_cap, per, pbr, dividend_yield, foreign_ratio = None, None, None, None, None, None
-        
+        bps, eps = None, None
+
         # 1. 현재가 파싱
         today_div = soup.select_one("p.no_today span.today")
         if today_div:
@@ -64,7 +65,7 @@ def fetch_naver_finance(code):
                 if blind_spans:
                     close_price = safe_int(blind_spans[0].text)
 
-        # 2. 시가총액 파싱 (억 단위 -> 원 단위)
+        # 2. 시가총액 파싱
         market_cap_elem = soup.select_one("#_market_sum")
         if market_cap_elem:
             cap_raw = market_cap_elem.text.replace('\n', '').replace('\t', '').replace(',', '').strip()
@@ -86,12 +87,12 @@ def fetch_naver_finance(code):
         if pbr_elem:
             pbr = safe_float(pbr_elem.text)
             
-        # 4. 배당수익률 (#_dvd_yield 우선 탐색 후, 우측/하단 테이블 탐색)
+        # 4. 배당수익률 파싱
         dvd_elem = soup.select_one("#_dvd_yield")
         if dvd_elem:
             dividend_yield = safe_float(dvd_elem.text)
             
-        # 5. 우측 우측 투자정보 테이블 반복 탐색 (외국인소진율, 배당수익률 보완)
+        # 5. 투자정보 테이블 탐색 (외국인소진율, BPS, EPS 보완 파싱)
         for tr in soup.select("div.aside_invest_info table tr"):
             tr_text = tr.text.strip()
             if "외국인소진율" in tr_text:
@@ -105,6 +106,18 @@ def fetch_naver_finance(code):
                         em = td.select_one("em")
                         val_str = em.text if em else td.text
                         dividend_yield = safe_float(val_str)
+            elif "BPS" in tr_text:
+                td = tr.select_one("td")
+                if td:
+                    em = td.select_one("em")
+                    val_str = em.text if em else td.text
+                    bps = safe_int(val_str)
+            elif "EPS" in tr_text and "추정" not in tr_text:
+                td = tr.select_one("td")
+                if td:
+                    em = td.select_one("em")
+                    val_str = em.text if em else td.text
+                    eps = safe_int(val_str)
 
         return {
             "close_price": close_price,
@@ -112,7 +125,9 @@ def fetch_naver_finance(code):
             "per": per,
             "pbr": pbr,
             "dividend_yield": dividend_yield,
-            "foreign_ratio": foreign_ratio
+            "foreign_ratio": foreign_ratio,
+            "bps": bps,
+            "eps": eps
         }
     except Exception as e:
         print(f"  └ 네이버 스크래핑 오류: {e}")
@@ -144,10 +159,17 @@ def run():
         stock_info = fetch_naver_finance(code)
         print(f"  └ 수집 결과: 주가={stock_info.get('close_price')}원, PER={stock_info.get('per')}, PBR={stock_info.get('pbr')}, 배당수익률={stock_info.get('dividend_yield')}%, 외국인={stock_info.get('foreign_ratio')}%")
 
-        # 2. DART 재무 수집
+        # 2. DART 재무 수집 (우선주의 경우 보통주 코드로 변환 시도)
         net_income, total_equity, roe = None, None, None
+        
+        # 우선주(끝자리가 5, 7, 8, 9 등)일 경우 본주(보통주) 코드로 DART 조회 시도
+        dart_code = code
+        if code.endswith('5') or code.endswith('7') or code.endswith('8'):
+            # 삼성화재우(00815) -> 삼성화재(000810) 처럼 끝자리 0으로 변경해 시도
+            dart_code = code[:-1] + '0'
+
         try:
-            fin = dart.finstate(code, current_year, reprt_code='11011')
+            fin = dart.finstate(dart_code, current_year, reprt_code='11011')
             if fin is not None and not fin.empty:
                 net_row = fin[fin['account_nm'].str.contains('당기순이익', na=False)]
                 eq_row = fin[fin['account_nm'].str.contains('자본총계', na=False)]
@@ -161,24 +183,42 @@ def run():
         except Exception as dart_err:
             print(f"  └ DART 수집 경고: {dart_err}")
 
+        # 3. 안전장치 (DART 실패 시 PBR/PER로 ROE 및 재무 지표 역산 보안)
+        per = stock_info.get("per")
+        pbr = stock_info.get("pbr")
+        market_cap = stock_info.get("market_cap")
+
+        if not roe and per and pbr and per > 0:
+            roe = round((pbr / per) * 100, 2)
+
+        if not total_equity and pbr and market_cap and pbr > 0:
+            total_equity = int(market_cap / pbr)
+
+        if not net_income and per and market_cap and per > 0:
+            net_income = int(market_cap / per)
+
+        # 4. 주주환원율 설정 (기본값으로 배당수익률 매핑)
+        dividend_yield = stock_info.get("dividend_yield")
+        shareholder_return_rate = dividend_yield  # 배당수익률을 기본 주주환원율로 활용
+
         payload = {
             "stock_code": code,
             "date": date_formatted,
             "close_price": stock_info.get("close_price"),
-            "market_cap": stock_info.get("market_cap"),
-            "per": stock_info.get("per"),
-            "pbr": stock_info.get("pbr"),
-            "dividend_yield": stock_info.get("dividend_yield"),
+            "market_cap": market_cap,
+            "per": per,
+            "pbr": pbr,
+            "dividend_yield": dividend_yield,
             "foreign_ratio": stock_info.get("foreign_ratio"),
             "net_income": net_income,
             "total_equity": total_equity,
             "roe": roe,
-            "shareholder_return_rate": None
+            "shareholder_return_rate": shareholder_return_rate
         }
 
         try:
             supabase.table("daily_stock_metrics").upsert(payload, on_conflict="stock_code,date").execute()
-            print(f"✅ [{name}] Supabase 저장 성공!")
+            print(f"✅ [{name}] Supabase 저장 성공! (주주환원율: {shareholder_return_rate}%, ROE: {roe}%)")
         except Exception as db_err:
             print(f"❌ [{name}] Supabase 저장 실패: {db_err}")
 
